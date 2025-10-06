@@ -9,152 +9,98 @@ from PIL import Image
 matplotlib.use('Agg')
 
 # --- 关键配置 ---
-IMAGE_SIZE = (32, 32)
+IMAGE_SIZE = (64, 64)  # 目标处理尺寸
 BATCH_SIZE = 32
 CHANNEL_DIM = 8
-FIXED_SNR_DB = 10.0  # Fixed DJSCC 的训练 SNR
-TEST_SNR_DB = 5.0  # 三种方法进行对比测试的 SNR
-ADAPTIVE_MIN_SNR = 0.0  # Adaptive DJSCC 训练范围
-ADAPTIVE_MAX_SNR = 20.0
-EPOCHS = 15  # 增加 Epoch 以确保 Adaptive 模型收敛
+SNR_DB = 10
+EPOCHS = 10
+
+# --- 数据集选择开关 ---
+# 选择: 'cifar_upsampled' (32x32 -> 64x64) 或 'imagenet_64' (模拟 64x64)
+# DATASET_CHOICE = 'cifar_upsampled'
 
 
-# ----------------- 编码器和解码器类 (调整为 32x32 结构 + Adaptive 支持) -----------------
+DATASET_CHOICE = 'imagenet_64'
+
+
+# ----------------- 编码器和解码器类 (64x64 结构) -----------------
+# 保持不变，结构已适配 64x64 -> 8x8
 class Encode(tf.keras.Model):
-    def __init__(self, c, is_adaptive=False):
+    def __init__(self, c):
         super().__init__()
-        self.is_adaptive = is_adaptive
+        # 1. 64x64 -> 32x32
+        self.conv1 = tf.keras.layers.Conv2D(filters=32, kernel_size=[3, 3], padding='same', activation=tf.nn.relu,
+                                            strides=2)
+        # 2. 32x32 -> 16x16
+        self.conv2 = tf.keras.layers.Conv2D(filters=64, kernel_size=[3, 3], padding='same', activation=tf.nn.relu,
+                                            strides=2)
+        # 3. 16x16 -> 8x8
+        self.conv3 = tf.keras.layers.Conv2D(filters=128, kernel_size=[3, 3], padding='same', activation=tf.nn.relu,
+                                            strides=2)
+        # 4. 8x8 -> 8x8
+        self.conv4 = tf.keras.layers.Conv2D(filters=128, kernel_size=[3, 3], padding='same', activation=tf.nn.relu,
+                                            strides=1)
+        # 5. 8x8 -> C 维度的信道特征
+        self.conv5 = tf.keras.layers.Conv2D(filters=c, kernel_size=[3, 3], padding='same', activation=tf.nn.relu,
+                                            strides=1)
 
-        # 图像处理层
-        self.conv1 = tf.keras.layers.Conv2D(filters=32, kernel_size=[3, 3], padding='same',
-                                            activation=tf.nn.relu, strides=2)  # 32->16
-        self.conv2 = tf.keras.layers.Conv2D(filters=64, kernel_size=[3, 3], padding='same',
-                                            activation=tf.nn.relu, strides=2)  # 16->8
-        self.conv3 = tf.keras.layers.Conv2D(filters=128, kernel_size=[3, 3], padding='same',
-                                            activation=tf.nn.relu, strides=1)  # 8->8
-
-        # --- Adaptive DJSCC 特有的 SNR 融合层 ---
-        if self.is_adaptive:
-            # 用于处理 SNR 标量的层
-            self.snr_dense = tf.keras.layers.Dense(units=128, activation=tf.nn.relu)
-            self.snr_conv = tf.keras.layers.Conv2D(filters=128, kernel_size=[1, 1], padding='same',
-                                                   activation=tf.nn.relu)
-
-        # 最终编码层 (将特征降到 C 维)
-        self.conv4 = tf.keras.layers.Conv2D(filters=c, kernel_size=[3, 3], padding='same',
-                                            activation=tf.nn.relu, strides=1)
-
-    def call(self, inputs):
-        if self.is_adaptive:
-            image, snr_value = inputs  # inputs 是 (image, snr_value)
-        else:
-            image = inputs  # inputs 只是 image
-
-        # 1. 处理图像
-        x = self.conv1(image)
+    def call(self, input):
+        x = self.conv1(input)
         x = self.conv2(x)
         x = self.conv3(x)
-
-        # 2. Adaptive DJSCC: SNR 融合
-        if self.is_adaptive:
-            # 扩展 SNR 嵌入以匹配 (B, 8, 8, 128)
-            snr_emb = self.snr_dense(snr_value)
-            # (B, 128) -> (B, 1, 1, 128) -> (B, 8, 8, 128)
-            snr_emb_conv = self.snr_conv(tf.expand_dims(tf.expand_dims(snr_emb, 1), 1))
-
-            # 融合
-            x = x + snr_emb_conv
-
-        # 3. 最终编码
-        output = self.conv4(x)
+        x = self.conv4(x)
+        output = self.conv5(x)
         return output
 
 
 class Decode(tf.keras.Model):
     def __init__(self):
         super().__init__()
-        # 逆向操作
+        # 1. 8x8 -> 8x8
         self.dconv1 = tf.keras.layers.Conv2DTranspose(filters=128, kernel_size=(3, 3), padding='same',
                                                       activation=tf.nn.relu, strides=1)
-        self.dconv2 = tf.keras.layers.Conv2DTranspose(filters=64, kernel_size=(3, 3), padding='same',
+        # 2. 8x8 -> 16x16
+        self.dconv2 = tf.keras.layers.Conv2DTranspose(filters=128, kernel_size=(3, 3), padding='same',
                                                       activation=tf.nn.relu, strides=2)
-        self.dconv3 = tf.keras.layers.Conv2DTranspose(filters=32, kernel_size=(3, 3), padding='same',
+        # 3. 16x16 -> 32x32
+        self.dconv3 = tf.keras.layers.Conv2DTranspose(filters=64, kernel_size=(3, 3), padding='same',
                                                       activation=tf.nn.relu, strides=2)
-        self.dconv4 = tf.keras.layers.Conv2DTranspose(filters=3, kernel_size=(3, 3), padding='same',
+        # 4. 32x32 -> 64x64
+        self.dconv4 = tf.keras.layers.Conv2DTranspose(filters=32, kernel_size=(3, 3), padding='same',
+                                                      activation=tf.nn.relu, strides=2)
+        # 5. 64x64 -> 64x64
+        self.dconv5 = tf.keras.layers.Conv2DTranspose(filters=3, kernel_size=(3, 3), padding='same',
                                                       activation=tf.nn.sigmoid, strides=1)
 
     def call(self, input):
         x = self.dconv1(input)
         x = self.dconv2(x)
         x = self.dconv3(x)
-        output = self.dconv4(x)
+        x = self.dconv4(x)
+        output = self.dconv5(x)
         return output
 
 
-# ----------------- Adaptive/Fixed DJSCC 模型封装 -----------------
+# ----------------- DJSCC 模型封装 (未修改) -----------------
 class DJSCC_Model(tf.keras.Model):
-    # 统一模型，通过 is_adaptive 和 fixed_snr_db 参数控制行为
-    def __init__(self, c, is_adaptive=False, fixed_snr_db=None, min_snr_db=0.0, max_snr_db=20.0):
+    def __init__(self, c, snr_db):
         super().__init__()
-        self.is_adaptive = is_adaptive
-        self.fixed_snr_db = fixed_snr_db  # 用于 Fixed DJSCC 训练
-        self.min_snr_db = min_snr_db
-        self.max_snr_db = max_snr_db
-
-        # 编码器需要知道是否为 Adaptive
-        self.encoder = Encode(c, is_adaptive=is_adaptive)
+        self.encoder = Encode(c)
         self.decoder = Decode()
 
+        self.snr_db = snr_db
+        snr_linear = 10 ** (self.snr_db / 10.0)
+        self.noise_stddev = tf.sqrt(1 / (2 * snr_linear))
+
     def call(self, inputs, training=False):
-        # inputs 结构：(image, target_image) 用于 Fixed DJSCC
-        # inputs 结构：((image, snr_db_tensor), target_image) 用于 Adaptive DJSCC
-
-        if self.is_adaptive:
-            # Adaptive 模型从 inputs 中解包 image 和 snr_db_tensor
-            image, snr_db_tensor = inputs[0], inputs[1]
-        else:
-            # Fixed 模型直接从 inputs 中获取 image (这里 snr_db_tensor 是 None 或占位符)
-            image = inputs[0]
-            snr_db_tensor = tf.constant(self.fixed_snr_db or TEST_SNR_DB, dtype=tf.float32)
-
-        # 1. 确定信道中使用的 SNR
-        if training and self.is_adaptive:
-            # Adaptive 训练: 随机 SNR
-            snr_db = tf.random.uniform(
-                shape=(tf.shape(image)[0], 1),
-                minval=self.min_snr_db,
-                maxval=self.max_snr_db,
-                dtype=tf.float32
-            )
-            # 编码器需要这个随机 SNR
-            encoder_input = (image, snr_db)
-        elif training:
-            # Fixed 训练: 固定 SNR
-            snr_db = tf.fill(dims=(tf.shape(image)[0], 1), value=tf.cast(self.fixed_snr_db, tf.float32))
-            # Fixed 编码器只需要图像
-            encoder_input = image
-        else:
-            # 测试/预测: 使用传入的 snr_db_tensor (或 Fixed 模型中的默认值)
-            snr_db = tf.fill(dims=(tf.shape(image)[0], 1), value=tf.cast(snr_db_tensor[0], tf.float32))
-            # 编码器需要这个测试 SNR
-            encoder_input = (image, snr_db) if self.is_adaptive else image
-
-        # 2. 编码
-        encoded_output = self.encoder(encoder_input)
-
-        # 3. 信道噪声
-        snr_linear = 10.0 ** (snr_db / 10.0)
-        noise_stddev = tf.sqrt(1.0 / (2.0 * snr_linear))
-
-        noise_stddev = tf.expand_dims(tf.expand_dims(noise_stddev, 1), 1)
+        encoded_output = self.encoder(inputs)
 
         if training:
-            noise = tf.random.normal(shape=tf.shape(encoded_output), mean=0.0, stddev=noise_stddev)
+            noise = tf.random.normal(shape=tf.shape(encoded_output), mean=0.0, stddev=self.noise_stddev)
             noisy_output = encoded_output + noise
         else:
             noisy_output = encoded_output
 
-        # 4. 解码
         decoded_output = self.decoder(noisy_output)
 
         return decoded_output
@@ -183,126 +129,151 @@ def classical_jssc_process(image_array, snr_db):
             reconstructed_array = np.stack([reconstructed_array] * 3, axis=-1)
     except:
         print("Warning: Decompression failed due to severe channel errors.")
-        reconstructed_array = np.zeros_like(image_array.squeeze())
+        reconstructed_array = np.zeros(IMAGE_SIZE + (3,), dtype=np.float32)
 
     return reconstructed_array
 
 
-# ----------------- 训练与可视化 (主要执行逻辑) -----------------
+# ----------------- 数据加载与预处理函数 -----------------
 
-def preprocess(x_data):
-    """归一化图像。"""
+def preprocess_cifar_upsample(x_data):
+    """加载 CIFAR-10 (32x32)，归一化并上采样到 64x64。"""
+    x_data = tf.cast(x_data, tf.float32) / 255.0
+    x_data = tf.image.resize(x_data, IMAGE_SIZE, method=tf.image.ResizeMethod.BILINEAR)
+    return x_data
+
+
+def preprocess_imagenet_64(x_data):
+    """加载 64x64 图像，归一化。"""
+    # 假设输入已经是 64x64 (或者已经由 load_imagenet_64 调整过)
     x_data = tf.cast(x_data, tf.float32) / 255.0
     return x_data
 
 
-def map_fixed_format(x):
-    """ Fixed DJSCC: (Image) -> (Image, Image)"""
+def load_imagenet_64():
+    """
+    **占位符函数**：用于模拟加载一个小型、预处理好的 64x64 ImageNet 样本数据集。
+    在真实场景中，您需要使用 tfds.load('imagenet_resized/64x64') 或您自己的数据集。
+
+    这里为了代码的可运行性，我们**生成随机数据**来模拟 64x64 ImageNet。
+    若要使用真实数据，请替换此逻辑。
+    """
+    print("WARNING: 正在使用随机数据模拟 ImageNet 64x64 数据集，请替换为真实数据！")
+    # 模拟 10,000 张训练图像和 1,000 张测试图像
+    n_train = 10000
+    n_test = 1000
+
+    x_train = np.random.randint(0, 256, size=(n_train, IMAGE_SIZE[0], IMAGE_SIZE[1], 3), dtype=np.uint8)
+    x_test = np.random.randint(0, 256, size=(n_test, IMAGE_SIZE[0], IMAGE_SIZE[1], 3), dtype=np.uint8)
+
+    # 返回 NumPy 数组，后续将被 tf.data.Dataset 转换为张量
+    return (x_train, None), (x_test, None)
+
+
+def load_dataset(dataset_choice):
+    """根据选择加载并预处理数据集。"""
+    if dataset_choice == 'cifar_upsampled':
+        print(f"--- 1. 加载 CIFAR-10 并上采样到 {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]} ---")
+        (x_train, _), (x_test, _) = tf.keras.datasets.cifar10.load_data()
+        preprocess_fn = preprocess_cifar_upsample
+    elif dataset_choice == 'imagenet_64':
+        print(f"--- 1. 模拟加载 64x64 ImageNet 数据集 ---")
+        (x_train, _), (x_test, _) = load_imagenet_64()  # 使用模拟数据
+        preprocess_fn = preprocess_imagenet_64
+    else:
+        raise ValueError(f"未知的数据集选择: {dataset_choice}")
+
+    # 将 NumPy 数组转换为 TensorFlow Dataset
+    train_ds = tf.data.Dataset.from_tensor_slices(x_train) \
+        .map(preprocess_fn) \
+        .map(map_to_autoencoder_format) \
+        .shuffle(1024) \
+        .batch(BATCH_SIZE)
+
+    test_ds = tf.data.Dataset.from_tensor_slices(x_test) \
+        .map(preprocess_fn) \
+        .map(map_to_autoencoder_format) \
+        .batch(BATCH_SIZE)
+
+    return train_ds, test_ds
+
+
+# --- 映射函数 ---
+def map_to_autoencoder_format(x):
     return x, x
 
 
-def map_adaptive_format(x):
-    """ Adaptive DJSCC: (Image) -> ((Image, SNR_Placeholder), Image)"""
-    # 占位符，实际 SNR 在模型 call 中随机生成或在测试时指定
-    snr_placeholder = tf.constant([0.0], dtype=tf.float32)
-    return (x, snr_placeholder), x
-
-
 if __name__ == "__main__":
-    # 1. 加载和预处理 CIFAR-10 数据
-    print("加载和预处理 CIFAR-10 数据集 (32x32)...")
-    (x_train, _), (x_test, _) = tf.keras.datasets.cifar10.load_data()
+    # 1. 加载和预处理数据 (根据 DATASET_CHOICE 决定)
+    try:
+        train_ds, test_ds = load_dataset(DATASET_CHOICE)
+    except Exception as e:
+        print(f"数据加载失败: {e}")
+        # 如果加载失败，终止程序
+        exit()
 
-    # 训练数据集 (用于 Fixed 和 Adaptive 训练)
-    train_data = tf.data.Dataset.from_tensor_slices(x_train).map(preprocess).shuffle(1024)
-    test_data = tf.data.Dataset.from_tensor_slices(x_test).map(preprocess)
+    # 2. 实例化 DJSCC 模型
+    djscc_model = DJSCC_Model(c=CHANNEL_DIM, snr_db=SNR_DB)
 
-    # Fixed DJSCC 数据集
-    fixed_train_ds = train_data.map(map_fixed_format).batch(BATCH_SIZE)
-    fixed_test_ds = test_data.map(map_fixed_format).batch(BATCH_SIZE)
-
-    # Adaptive DJSCC 数据集
-    adaptive_train_ds = train_data.map(map_adaptive_format).batch(BATCH_SIZE)
-    adaptive_test_ds = test_data.map(map_adaptive_format).batch(BATCH_SIZE)
-
-    # ------------------ A. 训练 Fixed DJSCC (SNR 10 dB) ------------------
-    fixed_model = DJSCC_Model(c=CHANNEL_DIM, is_adaptive=False, fixed_snr_db=FIXED_SNR_DB)
-    fixed_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+    # 3. 编译模型
+    djscc_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
                         loss=tf.keras.losses.MeanSquaredError())
 
-    print(f"\n--- 1. 开始训练 Fixed DJSCC (SNR {FIXED_SNR_DB} dB) ---")
-    fixed_model.fit(fixed_train_ds, epochs=EPOCHS, validation_data=fixed_test_ds, verbose=1)
+    # 4. 训练模型
+    dataset_name = DATASET_CHOICE.replace('_', ' ').title()
+    print(f"\n--- 2. 开始训练 DJSCC 模型 ({dataset_name} 输入), 信噪比 (SNR) 为 {SNR_DB} dB ---")
+    djscc_model.fit(train_ds,
+                    epochs=EPOCHS,
+                    validation_data=test_ds)
 
-    # ------------------ B. 训练 Adaptive DJSCC (SNR 0-20 dB) ------------------
-    adaptive_model = DJSCC_Model(c=CHANNEL_DIM, is_adaptive=True,
-                                 min_snr_db=ADAPTIVE_MIN_SNR, max_snr_db=ADAPTIVE_MAX_SNR)
-    adaptive_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-                           loss=tf.keras.losses.MeanSquaredError())
+    # 5. 可视化结果
+    print("\n--- 3. 开始可视化重建结果 ---")
 
-    print(f"\n--- 2. 开始训练 Adaptive DJSCC (SNR {ADAPTIVE_MIN_SNR}-{ADAPTIVE_MAX_SNR} dB) ---")
-    adaptive_model.fit(adaptive_train_ds, epochs=EPOCHS, validation_data=adaptive_test_ds, verbose=1)
-
-    # ------------------ C. 三重对比可视化 (在 TEST_SNR_DB 下) ------------------
-    print(f"\n--- 3. 开始在 SNR = {TEST_SNR_DB} dB 下进行三重对比 ---")
-
-    # 获取测试图像
-    test_images_x, _ = next(iter(fixed_test_ds))  # Fixed DS 返回 (X, Y)
+    # 从测试数据集中获取一批图像
+    test_images_x, _ = next(iter(test_ds))
     test_images_tensor = test_images_x
-    n_images = min(test_images_tensor.shape[0], 6)  # 展示 6 张图像
+    n_images = min(test_images_tensor.shape[0], 8)  # 展示 8 张图像
 
-    # 构建 Adaptive 模型测试输入：((Image, [TEST_SNR_DB]), Image)
-    test_snr_tensor = tf.fill(dims=(n_images, 1), value=tf.constant(TEST_SNR_DB, dtype=tf.float32))
-    adaptive_test_input = ((test_images_tensor[:n_images], test_snr_tensor), None)
+    # 使用 DJSCC 模型进行预测
+    reconstructed_images = djscc_model.predict(test_images_tensor[:n_images])
 
-    # 1. Fixed DJSCC 预测
-    fixed_reconstructions = fixed_model.predict(test_images_tensor[:n_images])
-
-    # 2. Adaptive DJSCC 预测
-    # 必须使用 model.predict(X) 格式，但 X 必须包含 (Image, SNR)
-    adaptive_test_images_only = test_images_tensor[:n_images]
-    adaptive_reconstructions = adaptive_model.predict((adaptive_test_images_only, test_snr_tensor))
-
-    # 3. Classical JSSC 预测
+    # 使用传统 JSSC 方法进行重建
+    print("开始使用传统 JSSC 方法进行重建...")
     classical_reconstructions = []
     for i in range(n_images):
         img_np = test_images_tensor[i].numpy()
-        reconstructed = classical_jssc_process(img_np, snr_db=TEST_SNR_DB)
+        reconstructed = classical_jssc_process(img_np, snr_db=SNR_DB)
         classical_reconstructions.append(reconstructed)
     classical_reconstructions = np.stack(classical_reconstructions, axis=0)
-
-    # 绘制对比图表 (四行: Original, Adaptive DJSCC, Fixed DJSCC, Classical JSSC)
-    plt.figure(figsize=(15, 8))
     test_images_display = test_images_tensor.numpy()[:n_images]
+
+    # 绘制对比图表
+    plt.figure(figsize=(15, 8))
 
     for i in range(n_images):
         # 原始图像 (第1行)
-        ax = plt.subplot(4, n_images, i + 1)
+        ax = plt.subplot(3, n_images, i + 1)
         plt.imshow(test_images_display[i])
-        if i == 0: ax.set_title("Original")
+        if i == 0: ax.set_title(f"Original ({dataset_name})")
         plt.axis("off")
 
-        # Adaptive DJSCC (第2行)
-        ax = plt.subplot(4, n_images, n_images + i + 1)
-        plt.imshow(adaptive_reconstructions[i])
-        if i == 0: ax.set_title("Adaptive DJSCC")
+        # DJSCC 重建图像 (第2行)
+        ax = plt.subplot(3, n_images, n_images + i + 1)
+        plt.imshow(reconstructed_images[i])
+        if i == 0: ax.set_title("DJSCC")
         plt.axis("off")
 
-        # Fixed DJSCC (第3行)
-        ax = plt.subplot(4, n_images, 2 * n_images + i + 1)
-        plt.imshow(fixed_reconstructions[i])
-        if i == 0: ax.set_title(f"Fixed DJSCC ({FIXED_SNR_DB}dB)")
-        plt.axis("off")
-
-        # 传统 JSSC (第4行)
-        ax = plt.subplot(4, n_images, 3 * n_images + i + 1)
+        # 传统 JSSC 重建图像 (第3行)
+        ax = plt.subplot(3, n_images, 2 * n_images + i + 1)
         if classical_reconstructions[i].shape == test_images_display[i].shape:
             plt.imshow(classical_reconstructions[i])
         else:
-            plt.imshow(classical_reconstructions[i][:32, :32, :])
+            # 兼容性处理，裁剪到 64x64
+            plt.imshow(classical_reconstructions[i][:IMAGE_SIZE[0], :IMAGE_SIZE[1], :])
         if i == 0: ax.set_title("Classical JSSC")
         plt.axis("off")
 
-    plt.suptitle(f"Triple Comparison on CIFAR-10 (32x32) at Test SNR = {TEST_SNR_DB} dB")
-    output_filename = f"triple_djscc_comparison_snr_{TEST_SNR_DB}db_32x32.png"
+    plt.suptitle(f"DJSCC ({dataset_name} 64x64) vs. Classical JSSC at SNR = {SNR_DB} dB")
+    output_filename = f"djscc_vs_classical_snr_{SNR_DB}db_{DATASET_CHOICE}_64x64.png"
     plt.savefig(output_filename)
     print(f"\n对比结果已保存为文件: {output_filename}")
